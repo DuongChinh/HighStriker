@@ -25,7 +25,6 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include "tm_stm32f4_mfrc522.h"
 #include "HX711.h"
 /* USER CODE END Includes */
 
@@ -39,11 +38,11 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define WEIGHT_STABILITY_THRESHOLD  0.01f
-#define WEIGHT_STABILITY_COUNT      5
+#define FORCE_STABILITY_THRESHOLD  0.01f
+#define FORCE_STABILITY_COUNT      5
 #define MEASUREMENT_INTERVAL        100
 #define DISPLAY_UPDATE_INTERVAL     500
-#define WEIGHT_FILTER_ALPHA         0.8f
+#define FORCE_FILTER_ALPHA         0.8f
 #define HX711_DT_PORT GPIOA
 #define HX711_DT_PIN  GPIO_PIN_11
 #define HX711_SCK_PORT GPIOA
@@ -62,13 +61,14 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 typedef struct {
-    float current_weight;
-    float previous_weight;
-    uint8_t weight_stable_count;
+    float current_force;
+    float previous_force;
+    float max_force; // Lưu giá trị lực lớn nhất
+    uint8_t force_stable_count;
     uint8_t system_ready;
     uint32_t last_measurement_time;
     uint32_t last_display_time;
-    float weight_threshold;
+    float force_threshold;
 } scale_state_t;
 
 scale_state_t scale_state = {0};
@@ -93,11 +93,10 @@ static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 void scale_init(void);
 void scale_calibrate(void);
-float scale_read_weight(void);
-float scale_filter_weight(float raw_weight);
-uint8_t scale_is_weight_stable(float weight);
-void scale_display_weight(float weight);
-void scale_process_rfid(float weight);
+float scale_read_force(void);
+float scale_filter_force(float raw_force);
+uint8_t scale_is_force_stable(float force);
+void scale_display_force(float force, float max_force);
 void scale_send_uart_data(const char* format, ...);
 void scale_handle_error(const char* error_msg);
 void LED_Control(uint8_t led_num, uint8_t state);
@@ -154,10 +153,11 @@ void scale_init(void) {
     set_scale(&hx711, SCALE_FACTOR, SCALE_FACTOR);
     scale_calibrate();
 
-    scale_state.current_weight = 0.0f;
-    scale_state.previous_weight = 0.0f;
-    scale_state.weight_stable_count = 0;
-    scale_state.weight_threshold = WEIGHT_STABILITY_THRESHOLD;
+    scale_state.current_force = 0.0f;
+    scale_state.previous_force = 0.0f;
+    scale_state.max_force = 0.0f; // Khởi tạo lực lớn nhất
+    scale_state.force_stable_count = 0;
+    scale_state.force_threshold = FORCE_STABILITY_THRESHOLD;
     scale_state.system_ready = 0;
 }
 
@@ -168,72 +168,61 @@ void scale_calibrate(void) {
     scale_send_uart_data("Calibration complete\r\n");
 }
 
-float scale_read_weight(void) {
+float scale_read_force(void) {
     if (!is_ready(&hx711)) return 0.0f;
 
-    float weight = get_weight(&hx711, 1, CHANNEL_A);
-    return (weight < 0.0f) ? 0.0f : weight;
+    float force = get_weight(&hx711, 1, CHANNEL_A);
+    return (force < 0.0f) ? 0.0f : force;
 }
 
-float scale_filter_weight(float raw_weight) {
-    static float filtered_weight = 0.0f;
+float scale_filter_force(float raw_force) {
+    static float filtered_force = 0.0f;
     static uint8_t first_reading = 1;
 
     if (first_reading) {
-        filtered_weight = raw_weight;
+        filtered_force = raw_force;
         first_reading = 0;
     } else {
-        filtered_weight = WEIGHT_FILTER_ALPHA * raw_weight + (1.0f - WEIGHT_FILTER_ALPHA) * filtered_weight;
+        filtered_force = FORCE_FILTER_ALPHA * raw_force + (1.0f - FORCE_FILTER_ALPHA) * filtered_force;
     }
-    return filtered_weight;
+    return filtered_force;
 }
 
-uint8_t scale_is_weight_stable(float weight) {
-    float weight_diff = fabsf(weight - scale_state.previous_weight);
+uint8_t scale_is_force_stable(float force) {
+    float force_diff = fabsf(force - scale_state.previous_force);
 
-    if (weight_diff < scale_state.weight_threshold) {
-        scale_state.weight_stable_count++;
-        if (scale_state.weight_stable_count >= WEIGHT_STABILITY_COUNT) {
-            scale_state.weight_stable_count = WEIGHT_STABILITY_COUNT;
-            scale_state.previous_weight = weight;
+    if (force_diff < scale_state.force_threshold) {
+        scale_state.force_stable_count++;
+        if (scale_state.force_stable_count >= FORCE_STABILITY_COUNT) {
+            scale_state.force_stable_count = FORCE_STABILITY_COUNT;
+            scale_state.previous_force = force;
             return 1;
         }
     } else {
-        scale_state.weight_stable_count = 0;
-        scale_state.previous_weight = weight;
+        scale_state.force_stable_count = 0;
+        scale_state.previous_force = force;
     }
     return 0;
 }
 
-void scale_display_weight(float weight) {
-    if (weight < 0.0f) weight = 0.0f;
+void scale_display_force(float force, float max_force) {
+    if (force < 0.0f) force = 0.0f;
+    if (max_force < 0.0f) max_force = 0.0f;
 
     // Giảm ngưỡng và thêm deadzone
-    if (weight < 0.02f) {  // Ngưỡng thấp hơn để tránh nhiễu
+    if (force < 0.02f) {  // Ngưỡng thấp hơn để tránh nhiễu
         DisplayNumber(0);
-        scale_send_uart_data("Weight: 0.00 kg (LEDs: 0)\r\n");
+        scale_send_uart_data("Force: 0.00 N (LEDs: 0) | Max Force: %.2f N\r\n", max_force);
         return;
     }
 
-    if (weight > 9.9f) weight = 9.9f;
+    if (force > 9.9f) force = 9.9f;
+    if (max_force > 9.9f) max_force = 9.9f;
 
-    // Tính số LED cần sáng (0-6)
-    uint8_t leds_to_light = (uint8_t)((weight / 9.9f) * 6 + 0.5f);
+    // Tính số LED cần sáng (0-6) cho lực lớn nhất
+    uint8_t leds_to_light = (uint8_t)((max_force / 9.9f) * 6 + 0.5f);
     DisplayNumber(leds_to_light);
-    scale_send_uart_data("Weight: %.2f kg (LEDs: %d)\r\n", weight, leds_to_light);
-}
-void scale_process_rfid(float weight) {
-    uint8_t CardID[5];
-
-    if (TM_MFRC522_Check(CardID) == MI_OK) {
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_14, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_13, GPIO_PIN_RESET);
-        scale_send_uart_data("RFID: %02X%02X%02X%02X%02X | Weight: %.3f kg\r\n",
-                           CardID[0], CardID[1], CardID[2], CardID[3], CardID[4], weight);
-    } else {
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_13, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_14, GPIO_PIN_RESET);
-    }
+    scale_send_uart_data("Force: %.2f N (LEDs: %d) | Max Force: %.2f N\r\n", force, leds_to_light, max_force);
 }
 
 void scale_send_uart_data(const char* format, ...) {
@@ -250,9 +239,9 @@ void scale_send_uart_data(const char* format, ...) {
 void scale_handle_error(const char* error_msg) {
     scale_send_uart_data("ERROR: %s\r\n", error_msg);
     for (int i = 0; i < 5; i++) {
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_13 | GPIO_PIN_14, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13, GPIO_PIN_SET);
         HAL_Delay(200);
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_13 | GPIO_PIN_14, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13, GPIO_PIN_RESET);
         HAL_Delay(200);
     }
 }
@@ -267,10 +256,7 @@ int main(void) {
     MX_TIM6_Init();
 
     /* USER CODE BEGIN 2 */
-    HAL_TIM_Base_Start_IT(&htim6);
-    TM_MFRC522_Init();
     scale_init();
-    BlinkLEDs(3, 200); // Nhấp nháy LED 3 lần khi khởi động
     DisplayNumber(0);
 
     scale_state.system_ready = 1;
@@ -283,20 +269,24 @@ int main(void) {
 
         if (current_time - scale_state.last_measurement_time >= MEASUREMENT_INTERVAL) {
             scale_state.last_measurement_time = current_time;
-            float raw_weight = scale_read_weight();
-            float filtered_weight = scale_filter_weight(raw_weight);
-            scale_state.current_weight = filtered_weight;
+            float raw_force = scale_read_force();
+            float filtered_force = scale_filter_force(raw_force);
+            scale_state.current_force = filtered_force;
 
-            if (scale_is_weight_stable(filtered_weight)) {
+            // Cập nhật lực lớn nhất
+            if (filtered_force > scale_state.max_force) {
+                scale_state.max_force = filtered_force;
+            }
+
+            if (scale_is_force_stable(filtered_force)) {
                 if (current_time - scale_state.last_display_time >= DISPLAY_UPDATE_INTERVAL) {
                     scale_state.last_display_time = current_time;
-                    scale_display_weight(scale_state.current_weight);
-                    scale_process_rfid(scale_state.current_weight);
+                    scale_display_force(scale_state.current_force, scale_state.max_force);
                 }
             } else {
                 if (current_time - scale_state.last_display_time >= (DISPLAY_UPDATE_INTERVAL / 2)) {
                     scale_state.last_display_time = current_time;
-                    scale_display_weight(scale_state.current_weight);
+                    scale_display_force(scale_state.current_force, scale_state.max_force);
                 }
             }
         }
@@ -337,14 +327,11 @@ static void MX_GPIO_Init(void) {
 
     __HAL_RCC_GPIOE_CLK_ENABLE();
     __HAL_RCC_GPIOH_CLK_ENABLE();
-    __HAL_RCC_GPIOG_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
     HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11
                             |GPIO_PIN_12|GPIO_PIN_13, GPIO_PIN_RESET);
-
-    HAL_GPIO_WritePin(GPIOG, GPIO_PIN_13|GPIO_PIN_14, GPIO_PIN_RESET);
 
     /*Configure GPIO pins : PE8 PE9 PE10 PE11 PE12 PE13 */
     GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10
@@ -353,10 +340,6 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
-
-    /*Configure GPIO pins : PG13 PG14 */
-    GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14;
-    HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
 }
 
 static void MX_SPI4_Init(void) {
